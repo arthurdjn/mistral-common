@@ -18,7 +18,10 @@ from jinja2 import BaseLoader
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from PIL import Image
 
-from mistral_common.integrations.chat_templates.template_generator import TemplateConfig
+from mistral_common.integrations.chat_templates.template_generator import (
+    MODEL_SETTINGS_FIELD_CHOICES,
+    TemplateConfig,
+)
 from mistral_common.protocol.instruct.request import ChatCompletionRequest, ReasoningEffort
 from mistral_common.protocol.instruct.validator import ValidationMode
 from mistral_common.tokens.tokenizers.audio import Audio
@@ -74,11 +77,8 @@ def _load_golden_template(config: TemplateConfig) -> str:
         model_settings_fields = config.model_settings_fields
         assert model_settings_fields is not None
         settings_part = "_".join(
-            filename
-            for field, filename in (
-                ("reasoning_effort", "reasoning_effort"),
-                ("json_schema", "response_format"),
-            )
+            "response_format" if field == "json_schema" else field
+            for field in MODEL_SETTINGS_FIELD_CHOICES
             if field in model_settings_fields
         )
         parts.append(settings_part)
@@ -99,6 +99,29 @@ def _load_golden_template(config: TemplateConfig) -> str:
     return path.read_text()
 
 
+def _build_model_settings_builder(config: TestConfig) -> ModelSettingsBuilder | None:
+    r"""Build the settings builders represented by a test configuration."""
+    if not config.version.supports_model_settings:
+        return None
+
+    selected_fields = config.model_settings_fields
+    if selected_fields is None:
+        selected_fields = frozenset({"reasoning_effort"})
+
+    return ModelSettingsBuilder(
+        reasoning_effort=(
+            EnumBuilder(
+                accepts_none=True,
+                default=ReasoningEffort.none,
+                values=[ReasoningEffort.none, ReasoningEffort.high],
+            )
+            if "reasoning_effort" in selected_fields
+            else None
+        ),
+        json_schema=(JSONSchemaBuilder(accepts_none=False, default=None) if "json_schema" in selected_fields else None),
+    )
+
+
 def render_template(
     template: str,
     messages: list[Any],
@@ -117,20 +140,8 @@ def render_template(
     def raise_exception(msg: str) -> None:
         raise ValueError(msg)
 
-    def tojson(
-        value: Any,
-        ensure_ascii: bool = False,
-        indent: int | None = None,
-        separators: tuple[str, str] | None = None,
-        sort_keys: bool = False,
-    ) -> str:
-        return json.dumps(
-            value,
-            ensure_ascii=ensure_ascii,
-            indent=indent,
-            separators=separators,
-            sort_keys=sort_keys,
-        )
+    def tojson(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False)
 
     env = ImmutableSandboxedEnvironment(loader=BaseLoader())
     env.globals["raise_exception"] = raise_exception
@@ -200,7 +211,11 @@ _AUDIO_URL = _sample_audio().to_base64("wav")
 _AUDIO = _AUDIO_URL
 
 
-def _build_tekken_json(config: TestConfig, output_dir: Path) -> Path:
+def _build_tekken_json(
+    config: TestConfig,
+    output_dir: Path,
+    model_settings_builder: ModelSettingsBuilder | None = None,
+) -> Path:
     r"""Build a tekken.json file for the given test config.
 
     Constructs a complete Tekken tokenizer JSON file by combining the base
@@ -212,6 +227,8 @@ def _build_tekken_json(config: TestConfig, output_dir: Path) -> Path:
     Args:
         config: Test configuration specifying version and feature flags.
         output_dir: Directory to write the JSON file into.
+        model_settings_builder: Settings builders to serialize, or `None` to derive
+            them from the test configuration.
 
     Returns:
         Path to the written tekken.json file.
@@ -252,23 +269,9 @@ def _build_tekken_json(config: TestConfig, output_dir: Path) -> Path:
             },
         }
 
-    if config.version.supports_model_settings:
-        model_settings_builder = ModelSettingsBuilder(
-            reasoning_effort=(
-                EnumBuilder(
-                    accepts_none=True,
-                    default=ReasoningEffort.none,
-                    values=[ReasoningEffort.none, ReasoningEffort.high],
-                )
-                if config.model_settings_fields is None or "reasoning_effort" in config.model_settings_fields
-                else None
-            ),
-            json_schema=(
-                JSONSchemaBuilder(accepts_none=False, default=None)
-                if config.model_settings_fields is not None and "json_schema" in config.model_settings_fields
-                else None
-            ),
-        )
+    if model_settings_builder is None:
+        model_settings_builder = _build_model_settings_builder(config)
+    if model_settings_builder is not None:
         tekken_data["model_settings_builder"] = model_settings_builder.model_dump(mode="json")
 
     tekken_path = output_dir / "tekken.json"
@@ -317,7 +320,12 @@ def _get_mistral_tekkenizer(config: TestConfig, output_dir: Path, validation_mod
     Returns:
         A configured `MistralTokenizer` instance.
     """
-    tekken_path = _build_tekken_json(config, output_dir)
+    model_settings_builder = _build_model_settings_builder(config)
+    tekken_path = _build_tekken_json(
+        config=config,
+        output_dir=output_dir,
+        model_settings_builder=model_settings_builder,
+    )
     return MistralTokenizer.from_file(str(tekken_path), mode=validation_mode)
 
 
